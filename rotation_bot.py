@@ -148,26 +148,49 @@ def _fetch_html_uncached(url: str):
     if not USE_PLAYWRIGHT_FALLBACK:
         return None
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        log.warning("Playwright not installed; cannot use browser fallback. "
-                    "Install with: pip install playwright && "
-                    "playwright install chromium")
-        return None
+    # Playwright's sync API refuses to run inside an asyncio event loop
+    # (the Telegram bot runs one). Running it in a separate worker thread
+    # sidesteps that entirely: the thread has no running loop, so the
+    # sync API is valid there.
+    return _playwright_fetch_in_thread(url)
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=HEADERS["User-Agent"])
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)  # let odds JS render
-            html = page.content()
-            browser.close()
-            return html
-    except Exception as e:
-        log.warning("Playwright fallback failed for %s: %s", url, e)
-        return None
+
+def _playwright_fetch_in_thread(url: str):
+    """Fetch a URL with sync Playwright, isolated in its own thread."""
+    import concurrent.futures
+
+    def _work():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            log.warning("Playwright not installed; cannot use browser "
+                        "fallback. Install: pip install playwright && "
+                        "playwright install chromium")
+            return None
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                page = browser.new_page(user_agent=HEADERS["User-Agent"])
+                page.goto(url, timeout=30000,
+                          wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)  # let odds JS render
+                html = page.content()
+                browser.close()
+                return html
+        except Exception as e:
+            log.warning("Playwright fetch failed for %s: %s", url, e)
+            return None
+
+    # A fresh thread has no asyncio loop, so sync Playwright is allowed.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        try:
+            return ex.submit(_work).result(timeout=60)
+        except Exception as e:
+            log.warning("Playwright thread failed for %s: %s", url, e)
+            return None
 
 # ---- ROTATION NUMBER RULES (confirmed from real scoresandodds data) --------
 #
@@ -447,7 +470,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n_lines = len([l for l in text.splitlines() if l.strip()])
     log.info("IN  (%d line(s))", n_lines)
     try:
-        reply = process_block(text)
+        # process_block does blocking network/Playwright work. Run it in a
+        # thread so the bot's asyncio loop stays responsive (and so the
+        # sync Playwright call is never on the loop thread).
+        import asyncio
+        reply = await asyncio.to_thread(process_block, text)
     except Exception as e:  # never let the bot die on one bad message
         log.exception("Error processing message")
         reply = f"Something went wrong: {e}"
