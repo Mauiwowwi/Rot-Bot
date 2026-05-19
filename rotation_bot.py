@@ -234,6 +234,34 @@ log = logging.getLogger("rotation_bot")
 
 OVER_UNDER_RE = re.compile(r"\b(over|under|o|u)\b\s*\d", re.IGNORECASE)
 
+# Futures / no-market keywords. If any of these appears as a whole word
+# (case-insensitive) in a line, it's a futures/season/prop bet with no
+# game on the odds board -> return the 1000 placeholder, do NOT try to
+# match a team name (which would wrongly grab that team's game number).
+#
+# Whole-word matching is important: "NO"/"YES" must not fire inside other
+# words (e.g. a city/team containing those letters). "Champion" also
+# covers "Championship"; "Cup" covers "World Cup" / "Stanley Cup".
+FUTURES_TERMS = [
+    r"finals?",
+    r"champion\w*",     # champion, champions, championship
+    r"yes",
+    r"no",
+    r"to\s+win",
+    r"series",
+    r"mvp",
+    r"cup",
+]
+FUTURES_RE = re.compile(
+    r"\b(" + "|".join(FUTURES_TERMS) + r")\b", re.IGNORECASE
+)
+
+
+def is_no_market(text: str) -> bool:
+    """True if the line is a futures/no-market bet (contains a futures
+    keyword as a whole word)."""
+    return bool(FUTURES_RE.search(text))
+
 
 def parse_message(text: str):
     """Pull the team/match name out of the user's line.
@@ -290,31 +318,43 @@ def _normalize(s: str) -> str:
 
 
 def _extract_rows(html: str):
-    """Return an ordered list of (rotation_int, team_text) for every game
-    row on the page, in the order they appear (away then home per game)."""
+    """Return an ordered list of (rotation_int, team_name) for every game
+    row on the page, in rotation order.
+
+    scoresandodds renders each row as:
+        <rotation> <Team Name> <Pitcher> (L/R) <odds...>
+    e.g. "927 White Sox Kay (L) o7.5 -110 ...". We capture the rotation
+    number and the team name, stopping the team name at the first thing
+    that clearly isn't part of it (a pitcher paren, a price, a number,
+    or known noise words).
+    """
     soup = BeautifulSoup(html, "html.parser")
     rows = []
     seen = set()
 
-    for el in soup.find_all(["tr", "li", "div", "a", "span", "p"]):
+    # rotation, then team words (letters/&/. and spaces), then stop.
+    row_re = re.compile(r"^(\d{3,6})\s+([A-Za-z][A-Za-z .&'-]+?)"
+                        r"(?:\s+[A-Z]?[a-z]*\s*\(|\s+[oOuU]?\d|\s+[+-]\d|$)")
+
+    for el in soup.find_all(["tr", "li", "div", "a", "span", "p", "td"]):
         txt = " ".join(el.get_text(" ", strip=True).split())
         if not txt:
             continue
-        # A team row: rotation number (3-6 digits) then a team name.
-        m = re.match(r"^(\d{3,6})\s+([A-Za-z].{1,40})$", txt)
+        m = row_re.match(txt)
         if not m:
             continue
         rot = int(m.group(1))
-        team = m.group(2).strip()
-        # Skip junk like "200073 Draw" or pure numbers.
-        if team.lower() in ("draw", "over", "under"):
+        team = m.group(2).strip(" .&'-")
+        low = team.lower()
+        if low in ("draw", "over", "under", "open", "line movements"):
+            continue
+        if len(team) < 2:
             continue
         if rot in seen:
             continue
         seen.add(rot)
         rows.append((rot, team))
 
-    # Sort by rotation so consecutive pairs (away=odd, home=even) line up.
     rows.sort(key=lambda r: r[0])
     return rows
 
@@ -340,17 +380,55 @@ def _pair_games(rows):
     return games
 
 
+def _team_match_score(query_norm: str, query_tokens: set, team: str):
+    """Score how well a scraped team name matches the user's query.
+
+    Higher is better; 0 means no match. The scoring favors the team
+    whose own words are all present in the query (e.g. site "White Sox"
+    fully inside "Chicago White Sox"), which prevents "Sox" alone from
+    matching both Red Sox and White Sox.
+    """
+    team_tokens = {_normalize(w) for w in re.split(r"[\s.&'-]+", team)
+                   if len(_normalize(w)) >= 2}
+    if not team_tokens:
+        return 0
+
+    # How many of the scraped team's words appear in the query?
+    in_query = sum(1 for tt in team_tokens if tt in query_tokens)
+
+    # Strong signal: every word of the scraped team name is in the query
+    # (e.g. {"white","sox"} all within "chicago white sox").
+    if in_query == len(team_tokens):
+        return 100 + in_query
+
+    # The scraped short name as one blob inside the query
+    # (e.g. "bluejays" in "torontobluejays").
+    team_blob = _normalize(team)
+    if len(team_blob) >= 5 and team_blob in query_norm:
+        return 90
+
+    # Partial: some words overlap. Only counts if the overlap includes a
+    # reasonably distinctive (>=4 char) word, so generic fragments like
+    # "sox" or "city" alone don't trigger a match.
+    distinctive = [tt for tt in team_tokens
+                   if tt in query_tokens and len(tt) >= 4]
+    if distinctive:
+        return 50 + in_query
+
+    return 0
+
+
 def find_game(query: str):
     """Find the game matching the query.
 
     Returns (game_dict, matched_side) where matched_side is 'away',
-    'home', or 'both' (for a matchup like "Arsenal/Burnley"), or
-    (None, None) if not found.
+    'home', or 'both', or (None, None) if not found. Chooses the
+    best-scoring game rather than the first loose substring hit.
     """
-    raw_tokens = re.split(r"[\s/]+", query.strip())
-    norm_tokens = [_normalize(t) for t in raw_tokens
-                   if _normalize(t) and len(t) >= 3]
-    if not norm_tokens:
+    query_norm = _normalize(query)
+    query_tokens = {_normalize(t) for t in re.split(r"[\s/]+", query.strip())
+                    if len(_normalize(t)) >= 2}
+    if not query_tokens:
         return None, None
 
     for url in SCRAPE_PAGES:
@@ -358,25 +436,30 @@ def find_game(query: str):
         if not html:
             continue
 
-        rows = _extract_rows(html)
-        games = _pair_games(rows)
+        games = _pair_games(_extract_rows(html))
 
-        best = None
+        best = None          # (score, game, side)
         for g in games:
-            na = _normalize(g["away"][1])
-            nh = _normalize(g["home"][1])
-            away_hit = any(t in na or na in _normalize(query)
-                           for t in norm_tokens)
-            home_hit = any(t in nh or nh in _normalize(query)
-                           for t in norm_tokens)
-            if away_hit and home_hit:
-                return g, "both"
-            if away_hit:
-                best = best or (g, "away")
-            elif home_hit:
-                best = best or (g, "home")
-        if best:
-            return best
+            sa = _team_match_score(query_norm, query_tokens, g["away"][1])
+            sh = _team_match_score(query_norm, query_tokens, g["home"][1])
+
+            if sa and sh:
+                # Both sides matched the query (e.g. "Away/Home" totals
+                # input) -> treat as a matchup.
+                cand = (max(sa, sh), g, "both")
+            elif sa:
+                cand = (sa, g, "away")
+            elif sh:
+                cand = (sh, g, "home")
+            else:
+                continue
+
+            if best is None or cand[0] > best[0]:
+                best = cand
+
+        # Require a real match, not a weak partial, before accepting.
+        if best and best[0] >= 50:
+            return best[1], best[2]
 
     return None, None
 
@@ -388,6 +471,12 @@ def find_game(query: str):
 def process(text: str) -> str:
     parsed = parse_message(text)
     query = parsed["query"]
+
+    # Futures / season / prop bet with no game on the board: return the
+    # 1000 placeholder WITHOUT matching a team name. Done before anything
+    # else so "Thunder NBA Finals YES" can't grab the Thunder's game #.
+    if is_no_market(text):
+        return f"1000 {text.strip()}"
 
     if not query:
         return ("I couldn't read a team name from that. Use the format:\n"
